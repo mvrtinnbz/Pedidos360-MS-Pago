@@ -6,6 +6,7 @@ import cl.transbank.webpay.webpayplus.responses.WebpayPlusTransactionCreateRespo
 import com.pedidos360.ms_pago.client.OrdenClient;
 import com.pedidos360.ms_pago.entity.AlertaFraude;
 import com.pedidos360.ms_pago.entity.Pago;
+import com.pedidos360.ms_pago.messaging.PagoEventPublisher;
 import com.pedidos360.ms_pago.repository.AlertaFraudeRepository;
 import com.pedidos360.ms_pago.repository.PagoRepository;
 import org.slf4j.Logger;
@@ -29,6 +30,7 @@ public class WebpayService {
     private final AlertaFraudeRepository alertaRepository;
     private final AntifraudeService antifraudeService;
     private final OrdenClient ordenClient;
+    private final PagoEventPublisher eventPublisher;
     private final WebpayPlus.Transaction transaction;
     private final String returnUrl;
 
@@ -36,12 +38,14 @@ public class WebpayService {
                          AlertaFraudeRepository alertaRepository,
                          AntifraudeService antifraudeService,
                          OrdenClient ordenClient,
+                         PagoEventPublisher eventPublisher,
                          WebpayPlus.Transaction transaction,
                          @Value("${webpay.return-url}") String returnUrl) {
         this.pagoRepository = pagoRepository;
         this.alertaRepository = alertaRepository;
         this.antifraudeService = antifraudeService;
         this.ordenClient = ordenClient;
+        this.eventPublisher = eventPublisher;
         this.transaction = transaction;
         this.returnUrl = returnUrl;
     }
@@ -134,7 +138,7 @@ public class WebpayService {
             return null;
         }
 
-        // Si ya se proceso (ej: el cliente recargo la pagina), no se confirma de nuevo
+        // Si ya se proceso (ej: el cliente recargo la pagina), no se confirma ni se publica de nuevo
         if (!Pago.PENDIENTE.equals(pago.getEstado())) {
             return pago;
         }
@@ -165,7 +169,8 @@ public class WebpayService {
         log.info("Webpay retorno: pago {} - orden {} -> {} ({})",
                 pago.getId(), pago.getOrdenId(), pago.getEstado(), pago.getDetalle());
 
-        // (Paso 2.3: aqui se avisara a ms-orders por RabbitMQ)
+        // Aviso a ms-orders por RabbitMQ
+        eventPublisher.publicarResultado(pago);
 
         return pago;
     }
@@ -181,6 +186,9 @@ public class WebpayService {
             pago = pagoRepository.save(pago);
             log.info("Webpay retorno: pago {} - orden {} -> RECHAZADO ({})",
                     pago.getId(), pago.getOrdenId(), motivo);
+
+            // Aviso a ms-orders por RabbitMQ
+            eventPublisher.publicarResultado(pago);
         }
         return pago;
     }
