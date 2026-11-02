@@ -41,10 +41,16 @@ public class AntifraudeService {
         }
     }
 
-    // Intentos previos con esta tarjeta dentro de la ventana de tiempo.
+    // Intentos previos con esta tarjeta dentro de la ventana de tiempo (pago simulado).
     public long intentosRecientes(String tarjetaHash) {
         LocalDateTime desde = LocalDateTime.now().minusSeconds(ventanaSegundos);
         return pagoRepository.countByTarjetaHashAndFechaCreacionAfter(tarjetaHash, desde);
+    }
+
+    // Intentos previos de este usuario dentro de la ventana de tiempo (Webpay).
+    public long intentosRecientesUsuario(String usuarioId) {
+        LocalDateTime desde = LocalDateTime.now().minusSeconds(ventanaSegundos);
+        return pagoRepository.countByUsuarioIdAndFechaCreacionAfter(usuarioId, desde);
     }
 
     // Si ya hubo 'maxIntentos' (3) en la ventana, el intento actual es sospechoso.

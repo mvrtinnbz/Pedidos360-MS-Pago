@@ -55,6 +55,10 @@ public class Pago {
     @Column(length = 255)
     private String detalle;
 
+    // Token que entrega Transbank al crear la transaccion (solo pagos WEBPAY)
+    @Column(length = 100)
+    private String tokenWebpay;
+
     @Column(nullable = false)
     private LocalDateTime fechaCreacion;
 
@@ -99,6 +103,9 @@ public class Pago {
 
     public String getDetalle() { return detalle; }
     public void setDetalle(String detalle) { this.detalle = detalle; }
+
+    public String getTokenWebpay() { return tokenWebpay; }
+    public void setTokenWebpay(String tokenWebpay) { this.tokenWebpay = tokenWebpay; }
 
     public LocalDateTime getFechaCreacion() { return fechaCreacion; }
     public void setFechaCreacion(LocalDateTime fechaCreacion) { this.fechaCreacion = fechaCreacion; }
