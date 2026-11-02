@@ -1,6 +1,7 @@
 package com.pedidos360.ms_pago.service;
 
 import cl.transbank.webpay.webpayplus.WebpayPlus;
+import cl.transbank.webpay.webpayplus.responses.WebpayPlusTransactionCommitResponse;
 import cl.transbank.webpay.webpayplus.responses.WebpayPlusTransactionCreateResponse;
 import com.pedidos360.ms_pago.client.OrdenClient;
 import com.pedidos360.ms_pago.entity.AlertaFraude;
@@ -18,6 +19,8 @@ import org.springframework.web.server.ResponseStatusException;
 public class WebpayService {
 
     private static final Logger log = LoggerFactory.getLogger(WebpayService.class);
+
+    private static final String PREFIJO_BUY_ORDER = "P360-";
 
     // Resultado de iniciar: el pago registrado + a donde redirigir al cliente
     public record InicioWebpay(Pago pago, String url, String token) {}
@@ -43,9 +46,13 @@ public class WebpayService {
         this.returnUrl = returnUrl;
     }
 
+    // ==========================================================
+    // 1. INICIAR: crea la transaccion en Transbank
+    // ==========================================================
+
     public InicioWebpay iniciar(Long ordenId, String usuarioId, String authorization) {
 
-        // 1. El monto sale de ms-orders, no del cliente
+        // El monto sale de ms-orders, no del cliente
         OrdenClient.OrdenDto orden = ordenClient.obtener(ordenId, authorization);
 
         if (orden.usuarioId() == null || !orden.usuarioId().equalsIgnoreCase(usuarioId)) {
@@ -55,7 +62,7 @@ public class WebpayService {
             throw new ResponseStatusException(HttpStatus.CONFLICT, "La orden ya fue pagada");
         }
 
-        // 2. Antifraude por usuario (con Webpay no conocemos la tarjeta)
+        // Antifraude por usuario (con Webpay no conocemos la tarjeta)
         long previos = antifraudeService.intentosRecientesUsuario(usuarioId);
 
         Pago pago = new Pago();
@@ -77,10 +84,9 @@ public class WebpayService {
         pago.setDetalle("Esperando pago en Webpay");
         pago = pagoRepository.save(pago);
 
-        // 3. Crear la transaccion en Transbank
         try {
-            String buyOrder = "P360-" + pago.getId();   // max 26 caracteres
-            String sessionId = "S-" + pago.getId();     // max 61 caracteres
+            String buyOrder = PREFIJO_BUY_ORDER + pago.getId();   // max 26 caracteres
+            String sessionId = "S-" + pago.getId();               // max 61 caracteres
 
             WebpayPlusTransactionCreateResponse respuesta = transaction.create(
                     buyOrder, sessionId, pago.getMonto().doubleValue(), returnUrl);
@@ -99,6 +105,96 @@ public class WebpayService {
             pagoRepository.save(pago);
             log.error("Error al crear transaccion Webpay (pago {}): {}", pago.getId(), e.getMessage());
             throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "No se pudo iniciar el pago con Webpay");
+        }
+    }
+
+    // ==========================================================
+    // 2. RETORNO: Webpay devuelve al cliente y se confirma el pago
+    // ==========================================================
+
+    // Devuelve el pago actualizado, o null si no se pudo identificar.
+    public Pago procesarRetorno(String tokenWs, String tbkToken, String tbkOrdenCompra) {
+
+        // Caso A: el cliente presiono "Anular" en Webpay
+        if (tbkToken != null) {
+            Pago pago = pagoRepository.findByTokenWebpay(tbkToken).orElse(null);
+            return cerrarSinCommit(pago, "Pago anulado por el usuario en Webpay");
+        }
+
+        // Caso B: se agoto el tiempo en el formulario (solo llega la orden de compra)
+        if (tokenWs == null) {
+            Pago pago = buscarPorBuyOrder(tbkOrdenCompra);
+            return cerrarSinCommit(pago, "Tiempo agotado en el formulario de Webpay");
+        }
+
+        // Caso C: flujo normal -> confirmar (commit) con Transbank
+        Pago pago = pagoRepository.findByTokenWebpay(tokenWs).orElse(null);
+        if (pago == null) {
+            log.warn("Retorno Webpay con token desconocido");
+            return null;
+        }
+
+        // Si ya se proceso (ej: el cliente recargo la pagina), no se confirma de nuevo
+        if (!Pago.PENDIENTE.equals(pago.getEstado())) {
+            return pago;
+        }
+
+        try {
+            WebpayPlusTransactionCommitResponse respuesta = transaction.commit(tokenWs);
+
+            if (respuesta.getCardDetail() != null && respuesta.getCardDetail().getCardNumber() != null) {
+                String numero = respuesta.getCardDetail().getCardNumber();
+                pago.setTarjetaUltimos4(numero.length() > 4 ? numero.substring(numero.length() - 4) : numero);
+            }
+
+            if (respuesta.getResponseCode() == 0 && "AUTHORIZED".equals(respuesta.getStatus())) {
+                pago.setEstado(Pago.APROBADO);
+                pago.setDetalle("Aprobado por Webpay - codigo de autorizacion " + respuesta.getAuthorizationCode());
+            } else {
+                pago.setEstado(Pago.RECHAZADO);
+                pago.setDetalle("Rechazado por Webpay (codigo de respuesta " + respuesta.getResponseCode() + ")");
+            }
+
+        } catch (Exception e) {
+            pago.setEstado(Pago.RECHAZADO);
+            pago.setDetalle("Error al confirmar el pago con Webpay");
+            log.error("Error en commit Webpay (pago {}): {}", pago.getId(), e.getMessage());
+        }
+
+        pago = pagoRepository.save(pago);
+        log.info("Webpay retorno: pago {} - orden {} -> {} ({})",
+                pago.getId(), pago.getOrdenId(), pago.getEstado(), pago.getDetalle());
+
+        // (Paso 2.3: aqui se avisara a ms-orders por RabbitMQ)
+
+        return pago;
+    }
+
+    private Pago cerrarSinCommit(Pago pago, String motivo) {
+        if (pago == null) {
+            log.warn("Retorno Webpay sin pago asociado ({})", motivo);
+            return null;
+        }
+        if (Pago.PENDIENTE.equals(pago.getEstado())) {
+            pago.setEstado(Pago.RECHAZADO);
+            pago.setDetalle(motivo);
+            pago = pagoRepository.save(pago);
+            log.info("Webpay retorno: pago {} - orden {} -> RECHAZADO ({})",
+                    pago.getId(), pago.getOrdenId(), motivo);
+        }
+        return pago;
+    }
+
+    // "P360-7" -> pago 7
+    private Pago buscarPorBuyOrder(String buyOrder) {
+        if (buyOrder == null || !buyOrder.startsWith(PREFIJO_BUY_ORDER)) {
+            return null;
+        }
+        try {
+            Long id = Long.valueOf(buyOrder.substring(PREFIJO_BUY_ORDER.length()));
+            return pagoRepository.findById(id).orElse(null);
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 

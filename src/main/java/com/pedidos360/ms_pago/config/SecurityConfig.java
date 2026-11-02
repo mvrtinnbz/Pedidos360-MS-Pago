@@ -32,9 +32,11 @@ public class SecurityConfig {
                 )
             )
 
-            // Todas las peticiones requieren autenticación
-            // (en la Fase 2 se abrira solo el retorno de Webpay)
             .authorizeHttpRequests(auth -> auth
+                // Retorno de Webpay: llega el navegador desde Transbank, sin token.
+                // Es seguro: el pago solo se aprueba si Transbank lo confirma (commit).
+                .requestMatchers("/api/pagos/webpay/retorno").permitAll()
+                // Todo lo demas requiere JWT de Azure
                 .anyRequest().authenticated()
             )
 
